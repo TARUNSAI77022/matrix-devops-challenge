@@ -23,24 +23,53 @@ VERSION=$(python3 -c "import json; print(json.load(open('models/manifest.json'))
           python -c "import json; print(json.load(open('models/manifest.json'))['version'])" 2>/dev/null || \
           grep -o '"version"[^,]*' models/manifest.json | cut -d'"' -f4 || echo "1.4.2")
 
-BUNDLE_NAME="release_v${VERSION}"
+# Determine target architecture (x86_64 vs aarch64 NVIDIA Jetson Orin)
+TARGET_ARCH="${1:-${TARGET_ARCH:-$(uname -m)}}"
+case "${TARGET_ARCH}" in
+    x86_64|amd64)
+        TARGET_ARCH="x86_64"
+        DOCKER_PLATFORM="linux/amd64"
+        ;;
+    aarch64|arm64)
+        TARGET_ARCH="aarch64"
+        DOCKER_PLATFORM="linux/arm64"
+        ;;
+    *)
+        TARGET_ARCH="$(uname -m)"
+        DOCKER_PLATFORM="linux/${TARGET_ARCH}"
+        ;;
+esac
+
+BUNDLE_NAME="release_v${VERSION}_${TARGET_ARCH}"
 TAR_FILE="${BUNDLE_NAME}.tar.gz"
 STAGING_DIR="dist/${BUNDLE_NAME}"
 
-log_info "Packaging air-gapped release bundle: ${BUNDLE_NAME}"
+log_info "Packaging air-gapped release bundle: ${BUNDLE_NAME} (Target Arch: ${TARGET_ARCH}, Platform: ${DOCKER_PLATFORM})"
 
 # 2. Verify model integrity locally before packaging
-log_info "Verifying model engine SHA256..."
-EXPECTED_SHA=$(python3 -c "import json; print(json.load(open('models/manifest.json'))['sha256'])" 2>/dev/null || \
-               python -c "import json; print(json.load(open('models/manifest.json'))['sha256'])" 2>/dev/null || \
-               grep -o '"sha256"[^,]*' models/manifest.json | cut -d'"' -f4)
+MODEL_MANIFEST="models/manifest.json"
+if [ -f "models/${TARGET_ARCH}/manifest.json" ]; then
+    MODEL_MANIFEST="models/${TARGET_ARCH}/manifest.json"
+    log_info "Selected architecture-specific manifest: ${MODEL_MANIFEST}"
+fi
+
+MODEL_ENGINE="models/eo_detector_fp16.engine"
+if [ -f "models/${TARGET_ARCH}/eo_detector_fp16.engine" ]; then
+    MODEL_ENGINE="models/${TARGET_ARCH}/eo_detector_fp16.engine"
+    log_info "Selected architecture-specific engine: ${MODEL_ENGINE}"
+fi
+
+log_info "Verifying model engine SHA256 against ${MODEL_MANIFEST}..."
+EXPECTED_SHA=$(python3 -c "import json; print(json.load(open('${MODEL_MANIFEST}'))['sha256'])" 2>/dev/null || \
+               python -c "import json; print(json.load(open('${MODEL_MANIFEST}'))['sha256'])" 2>/dev/null || \
+               grep -o '"sha256"[^,]*' "${MODEL_MANIFEST}" | cut -d'"' -f4)
 
 if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL_SHA=$(sha256sum models/eo_detector_fp16.engine | awk '{print $1}')
+    ACTUAL_SHA=$(sha256sum "${MODEL_ENGINE}" | awk '{print $1}')
 elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL_SHA=$(shasum -a 256 models/eo_detector_fp16.engine | awk '{print $1}')
+    ACTUAL_SHA=$(shasum -a 256 "${MODEL_ENGINE}" | awk '{print $1}')
 else
-    ACTUAL_SHA=$(python3 -c "import hashlib; print(hashlib.sha256(open('models/eo_detector_fp16.engine','rb').read()).hexdigest())")
+    ACTUAL_SHA=$(python3 -c "import hashlib; print(hashlib.sha256(open('${MODEL_ENGINE}','rb').read()).hexdigest())")
 fi
 
 if [ "${EXPECTED_SHA}" != "${ACTUAL_SHA}" ]; then
@@ -51,18 +80,21 @@ if [ "${EXPECTED_SHA}" != "${ACTUAL_SHA}" ]; then
 fi
 log_succ "Model checksum verified: ${ACTUAL_SHA:0:16}..."
 
-# 3. Build container images with release tags
-log_info "Building container images for release v${VERSION}..."
-docker compose build
+# 3. Build container images with release tags for target architecture
+log_info "Building container images for release v${VERSION} on ${DOCKER_PLATFORM}..."
+DOCKER_DEFAULT_PLATFORM="${DOCKER_PLATFORM}" docker compose build
 
 # Tag images explicitly for export
 IMAGE_WORKER="devops_challenge-inference_worker:v${VERSION}"
 IMAGE_API="devops_challenge-vision_api:v${VERSION}"
 IMAGE_PG="postgres:15-alpine"
 
-# Pull PostgreSQL base image before exporting it
-log_info "Pulling PostgreSQL base image (${IMAGE_PG})..."
-docker pull "${IMAGE_PG}"
+# Pull PostgreSQL base image for target platform before exporting it (fail if unavailable)
+log_info "Pulling PostgreSQL base image (${IMAGE_PG}) for ${DOCKER_PLATFORM}..."
+if ! docker pull --platform "${DOCKER_PLATFORM}" "${IMAGE_PG}"; then
+    log_err "Failed to pull PostgreSQL image for target platform ${DOCKER_PLATFORM}! Aborting packaging."
+    exit 1
+fi
 
 # Verify all required images exist before packaging
 log_info "Verifying all required container images exist locally..."
@@ -87,10 +119,11 @@ docker save "${IMAGE_WORKER}" "${IMAGE_API}" "${IMAGE_PG}" | gzip -c > "${STAGIN
 log_info "Copying configuration, models, and deployment runbooks..."
 cp "docker-compose.yml" "${STAGING_DIR}/"
 cp ".env.example" "${STAGING_DIR}/"
-cp "models/manifest.json" "${STAGING_DIR}/models/"
-cp "models/eo_detector_fp16.engine" "${STAGING_DIR}/models/"
+cp "${MODEL_MANIFEST}" "${STAGING_DIR}/models/manifest.json"
+cp "${MODEL_ENGINE}" "${STAGING_DIR}/models/eo_detector_fp16.engine"
 cp "deploy_airgap.sh" "${STAGING_DIR}/"
 chmod +x "${STAGING_DIR}/deploy_airgap.sh"
+echo "${TARGET_ARCH}" > "${STAGING_DIR}/.release_arch"
 
 # 7. Generate SHA256SUMS checksum manifest covering every payload file
 log_info "Validating checksum generation utilities..."

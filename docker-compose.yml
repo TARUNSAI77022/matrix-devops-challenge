@@ -2,12 +2,12 @@ services:
   postgres:
     image: postgres:15-alpine
     restart: unless-stopped
-    security_opt:
-      - no-new-privileges:true
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s
@@ -21,6 +21,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    pull_policy: build
     command: ["python", "inference_worker/worker.py"]
     restart: unless-stopped
     security_opt:
@@ -28,10 +29,14 @@ services:
     environment:
       ENGINE_PATH: /app/models/eo_detector_fp16.engine
       MANIFEST_PATH: /app/models/manifest.json
+      TRT_CACHE_DIR: /tmp/.trt_cache
       WORKER_PORT: ${WORKER_PORT}
       ENGINE_WARMUP_SEC: "2.0"
+    volumes:
+      - ./models/eo_detector_fp16.engine:/app/models/eo_detector_fp16.engine:ro
+      - ./models/manifest.json:/app/models/manifest.json:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      test: ["CMD-SHELL", "curl -f http://localhost:$$WORKER_PORT/status"]
       interval: 5s
       timeout: 3s
       retries: 2
@@ -44,6 +49,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    pull_policy: build
     command: ["python", "vision_api/app.py"]
     restart: unless-stopped
     security_opt:
@@ -56,14 +62,14 @@ services:
       DB_PASSWORD: ${POSTGRES_PASSWORD}
       DB_NAME: ${POSTGRES_DB}
     ports:
-      - "${APP_PORT}:8000"
+      - "${APP_PORT}:${APP_PORT}"
     depends_on:
       inference_worker:
         condition: service_healthy
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD-SHELL", "curl -f http://localhost:$$APP_PORT/health"]
       interval: 5s
       timeout: 3s
       retries: 3
@@ -78,3 +84,7 @@ networks:
   sensor_backplane:
     driver: bridge
     internal: true
+
+volumes:
+  postgres_data:
+    name: eoir-postgres-data

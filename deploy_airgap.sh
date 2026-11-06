@@ -85,10 +85,53 @@ if [ "${MISSING_VARS}" -gt 0 ]; then
     log_err "Please configure .env before starting the stack."
     exit 1
 fi
-log_succ "All required environment variables validated successfully."
 
-# 3. Load Offline Container Images
+# Reject default placeholder password
+PG_PASSWORD=$(grep -E "^POSTGRES_PASSWORD=" .env 2>/dev/null | cut -d'=' -f2- | tr -d ' "\r\n' || true)
+if [ "${PG_PASSWORD}" = "CHANGE_ME" ]; then
+    log_err "POSTGRES_PASSWORD is set to default placeholder 'CHANGE_ME'!"
+    log_err "Please enter the real production password locally in .env on the offline host."
+    exit 1
+fi
+
+# Validate network ports are valid integers within [1, 65535]
+APP_PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | cut -d'=' -f2- | tr -d ' "\r\n' || echo "8000")
+WORKER_PORT=$(grep -E '^WORKER_PORT=' .env 2>/dev/null | cut -d'=' -f2- | tr -d ' "\r\n' || echo "9000")
+
+for port in "${APP_PORT}" "${WORKER_PORT}"; do
+    if ! [[ "${port}" =~ ^[0-9]+$ ]] || [ "${port}" -lt 1 ] || [ "${port}" -gt 65535 ]; then
+        log_err "Invalid port number '${port}' in .env! Must be an integer between 1 and 65535."
+        exit 1
+    fi
+done
+
+log_succ "All environment variables, passwords, and ports validated successfully."
+
+# 3. Architecture Compatibility & Image Ingestion
 log_info "Step 3/5: Ingesting container images from images.tar.gz..."
+
+# Validate host architecture matches release package architecture
+if [ -f ".release_arch" ]; then
+    PKG_ARCH=$(cat .release_arch | tr -d ' \r\n')
+    HOST_ARCH=$(uname -m)
+    case "${HOST_ARCH}" in
+        x86_64|amd64) HOST_ARCH_NORM="x86_64" ;;
+        aarch64|arm64) HOST_ARCH_NORM="aarch64" ;;
+        *) HOST_ARCH_NORM="${HOST_ARCH}" ;;
+    esac
+    case "${PKG_ARCH}" in
+        x86_64|amd64) PKG_ARCH_NORM="x86_64" ;;
+        aarch64|arm64) PKG_ARCH_NORM="aarch64" ;;
+        *) PKG_ARCH_NORM="${PKG_ARCH}" ;;
+    esac
+    if [ "${HOST_ARCH_NORM}" != "${PKG_ARCH_NORM}" ]; then
+        log_err "CRITICAL: Architecture mismatch! Release package was built for '${PKG_ARCH}', but host is '${HOST_ARCH}'."
+        log_err "Aborting deployment to avoid running incompatible container binaries and TensorRT engines."
+        exit 1
+    fi
+    log_succ "Host architecture (${HOST_ARCH}) matches release package architecture (${PKG_ARCH})."
+fi
+
 if [ ! -f "images.tar.gz" ]; then
     log_err "images.tar.gz not found! Cannot deploy in air-gapped environment."
     exit 1
@@ -99,13 +142,12 @@ log_succ "Container images loaded into local Docker engine."
 
 # 4. Start Stack Offline
 log_info "Step 4/5: Starting microservices stack with Docker Compose..."
-# Enforce offline execution (--no-build and --pull never strictly prevent remote registry requests)
-docker compose down --remove-orphans 2>/dev/null || true
+# Enforce offline execution without teardown downtime (--no-build and --pull never prevent external registry requests)
 docker compose up -d --no-build --pull never
 
 # 5. Health Probes & End-to-End Verification
 log_info "Step 5/5: Running post-deployment health probes..."
-APP_PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | cut -d'=' -f2 || echo "8000")
+APP_PORT=$(grep -E '^APP_PORT=' .env 2>/dev/null | cut -d'=' -f2- | tr -d ' "\r\n' || echo "8000")
 APP_PORT="${APP_PORT:-8000}"
 HEALTH_URL="http://localhost:${APP_PORT}/health"
 DETECT_URL="http://localhost:${APP_PORT}/api/v1/detect"
@@ -116,8 +158,8 @@ SUCCESS=0
 
 log_info "Waiting for services to become healthy at ${HEALTH_URL}..."
 for i in $(seq 1 "${MAX_RETRIES}"); do
-    if curl -s -f "${HEALTH_URL}" > /dev/null 2>&1; then
-        HEALTH_RESP=$(curl -s "${HEALTH_URL}")
+    if curl -fsS --connect-timeout 3 --max-time 10 "${HEALTH_URL}" > /dev/null 2>&1; then
+        HEALTH_RESP=$(curl -fsS --connect-timeout 3 --max-time 10 "${HEALTH_URL}" || echo "")
         if echo "${HEALTH_RESP}" | grep -q '"worker_ready": *true'; then
             log_succ "Health check passed on attempt ${i}!"
             SUCCESS=1
@@ -139,7 +181,7 @@ fi
 
 # Test detection inference
 log_info "Testing detection endpoint: ${DETECT_URL}..."
-DETECT_RESP=$(curl -s -f "${DETECT_URL}" || echo "")
+DETECT_RESP=$(curl -fsS --connect-timeout 3 --max-time 10 "${DETECT_URL}" || echo "")
 
 if echo "${DETECT_RESP}" | grep -q '"stream": *"EO_CAM_01"'; then
     log_succ "Live detection verified: ${DETECT_RESP}"
