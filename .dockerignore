@@ -1,6 +1,7 @@
 .git
 .github
 tests/
+.agent/
 .env
 .env.*
 !.env.example
@@ -12,4 +13,10 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+dist/
+*.tar.gz
+models/.trt_cache/
+*.lock
+package_airgap.sh
+deploy_airgap.sh
 

@@ -21,6 +21,9 @@ def check_worker():
 
 
 class Handler(BaseHTTPRequestHandler):
+    server_version = "VisionAPI"
+    sys_version = ""
+
     def _send(self, code, payload):
         body = json.dumps(payload).encode("utf-8")
         self.send_response(code)

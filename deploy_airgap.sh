@@ -66,7 +66,26 @@ if [ ! -f ".env" ]; then
     fi
 else
     log_info "Existing .env configuration detected."
+    chmod 600 .env
 fi
+
+# Validate required environment variables are present and non-empty
+REQUIRED_VARS=("POSTGRES_USER" "POSTGRES_PASSWORD" "POSTGRES_DB" "APP_PORT" "WORKER_PORT")
+MISSING_VARS=0
+for var in "${REQUIRED_VARS[@]}"; do
+    val=$(grep -E "^${var}=" .env 2>/dev/null | cut -d'=' -f2- | tr -d ' "\r\n' || true)
+    if [ -z "${val}" ]; then
+        log_err "Required environment variable '${var}' is missing or empty in .env"
+        MISSING_VARS=$((MISSING_VARS + 1))
+    fi
+done
+
+if [ "${MISSING_VARS}" -gt 0 ]; then
+    log_err "Environment configuration validation failed: ${MISSING_VARS} required variable(s) missing or unset."
+    log_err "Please configure .env before starting the stack."
+    exit 1
+fi
+log_succ "All required environment variables validated successfully."
 
 # 3. Load Offline Container Images
 log_info "Step 3/5: Ingesting container images from images.tar.gz..."
@@ -80,9 +99,9 @@ log_succ "Container images loaded into local Docker engine."
 
 # 4. Start Stack Offline
 log_info "Step 4/5: Starting microservices stack with Docker Compose..."
-# Enforce offline execution (--no-build prevents accidental build attempts)
+# Enforce offline execution (--no-build and --pull never strictly prevent remote registry requests)
 docker compose down --remove-orphans 2>/dev/null || true
-docker compose up -d --no-build
+docker compose up -d --no-build --pull never
 
 # 5. Health Probes & End-to-End Verification
 log_info "Step 5/5: Running post-deployment health probes..."

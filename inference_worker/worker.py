@@ -1,5 +1,6 @@
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -19,7 +20,7 @@ def verify_engine():
     expected = manifest.get("sha256", "")
     with open(ENGINE_PATH, "rb") as ef:
         actual = hashlib.sha256(ef.read()).hexdigest()
-    if actual != expected:
+    if not hmac.compare_digest(actual, expected):
         return False, expected, actual
     try:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -33,6 +34,9 @@ def verify_engine():
 
 
 class WorkerHandler(BaseHTTPRequestHandler):
+    server_version = "InferenceWorker"
+    sys_version = ""
+
     def do_GET(self):
         valid, expected, actual = verify_engine()
         if self.path == "/status":

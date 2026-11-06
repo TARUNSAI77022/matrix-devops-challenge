@@ -60,8 +60,19 @@ IMAGE_WORKER="devops_challenge-inference_worker:v${VERSION}"
 IMAGE_API="devops_challenge-vision_api:v${VERSION}"
 IMAGE_PG="postgres:15-alpine"
 
-docker tag "${IMAGE_WORKER}" "devops_challenge-inference_worker:latest" 2>/dev/null || true
-docker tag "${IMAGE_API}" "devops_challenge-vision_api:latest" 2>/dev/null || true
+# Pull PostgreSQL base image before exporting it
+log_info "Pulling PostgreSQL base image (${IMAGE_PG})..."
+docker pull "${IMAGE_PG}"
+
+# Verify all required images exist before packaging
+log_info "Verifying all required container images exist locally..."
+for img in "${IMAGE_WORKER}" "${IMAGE_API}" "${IMAGE_PG}"; do
+    if ! docker image inspect "${img}" >/dev/null 2>&1; then
+        log_err "Required container image ${img} not found locally! Packaging aborted."
+        exit 1
+    fi
+    log_succ "Verified image: ${img}"
+done
 
 # 4. Prepare fresh staging directory
 log_info "Preparing staging directory at ${STAGING_DIR}..."
@@ -81,7 +92,13 @@ cp "models/eo_detector_fp16.engine" "${STAGING_DIR}/models/"
 cp "deploy_airgap.sh" "${STAGING_DIR}/"
 chmod +x "${STAGING_DIR}/deploy_airgap.sh"
 
-# 7. Generate cryptographic SHA256SUMS manifest covering every payload file
+# 7. Generate SHA256SUMS checksum manifest covering every payload file
+log_info "Validating checksum generation utilities..."
+if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+    log_err "Neither 'sha256sum' nor 'shasum' is installed! Cannot generate SHA256SUMS manifest."
+    exit 1
+fi
+
 log_info "Generating SHA256SUMS manifest..."
 (
     cd "${STAGING_DIR}"
@@ -96,6 +113,11 @@ log_info "Generating SHA256SUMS manifest..."
         fi
     done > "SHA256SUMS"
 )
+
+if [ ! -s "${STAGING_DIR}/SHA256SUMS" ]; then
+    log_err "Generated SHA256SUMS manifest is empty or missing! Aborting packaging."
+    exit 1
+fi
 log_succ "SHA256SUMS manifest generated successfully:"
 sed 's/^/  /' "${STAGING_DIR}/SHA256SUMS"
 
