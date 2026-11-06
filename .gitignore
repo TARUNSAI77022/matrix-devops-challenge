@@ -1,0 +1,22 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Air-gapped release bundles & build artifacts
+release_v*.tar.gz
+dist/
+*.tar.gz
+
+# Local TRT cache and lock files
+models/.trt_cache/
+*.lock
+

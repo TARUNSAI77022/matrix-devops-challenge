@@ -1,0 +1,113 @@
+name: Site-Release-CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Cancel in-progress runs when new commits are pushed
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Opt into Node 24 runtime to silence deprecation warnings
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  lint_and_test:
+    name: Lint, Syntax, Compose & Model Verification
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Python Syntax & Lint Audit
+        run: |
+          echo "Verifying Python syntax across all services..."
+          python -m py_compile vision_api/app.py inference_worker/worker.py tests/*.py
+
+      - name: Verify Model Artifact Integrity
+        run: |
+          echo "Verifying model artifacts match models/manifest.json..."
+          python -c "
+          import json, hashlib, os, sys
+          manifest_path = 'models/manifest.json'
+          engine_path = 'models/eo_detector_fp16.engine'
+          if not os.path.exists(manifest_path) or not os.path.exists(engine_path):
+              sys.exit('Model artifact files missing!')
+          with open(manifest_path, 'r', encoding='utf-8') as f:
+              m = json.load(f)
+          actual = hashlib.sha256(open(engine_path, 'rb').read()).hexdigest()
+          expected = m.get('sha256', '')
+          if actual != expected:
+              sys.exit(f'Model checksum mismatch! Expected {expected}, got {actual}')
+          print(f'Model verified: version={m.get(\"version\")}, sha256={actual}')
+          "
+
+      - name: Run Unit Tests
+        run: |
+          # Fails immediately if any unit test fails (no '|| true' suppression)
+          python -m unittest discover -s tests
+
+      - name: Validate Docker Compose Orchestration
+        run: |
+          echo "Validating docker-compose.yml configuration and environment contracts..."
+          cp .env.example .env
+          docker compose config --quiet
+
+  build_and_publish:
+    name: Build, Audit & Publish Immutable Image
+    needs: lint_and_test
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract Release Metadata
+        id: meta
+        run: |
+          VERSION=$(python -c "import json; print(json.load(open('models/manifest.json'))['version'])")
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          TAG="${VERSION}-${SHORT_SHA}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_ENV
+
+      - name: Build Multi-Stage Docker Image
+        run: |
+          docker build \
+            --tag registry.site.local/eoir-stack:${IMAGE_TAG} \
+            --tag registry.site.local/eoir-stack:${{ steps.meta.outputs.version }} \
+            .
+
+      - name: Audit Image Size (< 220 MB limit)
+        run: |
+          MAX_BYTES=$((220 * 1024 * 1024))
+          IMAGE_BYTES=$(docker inspect -f '{{ .Size }}' registry.site.local/eoir-stack:${IMAGE_TAG})
+          IMAGE_MB=$((IMAGE_BYTES / 1024 / 1024))
+          echo "Built Image Size: ${IMAGE_MB} MB (${IMAGE_BYTES} bytes)"
+          if [ "$IMAGE_BYTES" -gt "$MAX_BYTES" ]; then
+            echo "ERROR: Image size (${IMAGE_MB} MB) exceeds maximum allowed 220 MB limit!"
+            exit 1
+          fi
+
+      - name: Audit Non-Root User Configuration
+        run: |
+          RUNTIME_USER=$(docker inspect -f '{{ .Config.User }}' registry.site.local/eoir-stack:${IMAGE_TAG})
+          echo "Configured runtime user: ${RUNTIME_USER}"
+          if [ -z "$RUNTIME_USER" ] || [ "$RUNTIME_USER" = "0" ] || [ "$RUNTIME_USER" = "root" ]; then
+            echo "ERROR: Image is configured to run as root!"
+            exit 1
+          fi
+
+      - name: Promote to Defence Site Baseline (Main branch only)
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          echo "Promoting immutable release registry.site.local/eoir-stack:${IMAGE_TAG} to defence site baseline"

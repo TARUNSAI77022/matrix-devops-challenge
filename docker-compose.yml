@@ -1,0 +1,78 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    networks:
+      - sensor_backplane
+
+  inference_worker:
+    image: devops_challenge-inference_worker:v1.4.2
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "inference_worker/worker.py"]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      ENGINE_PATH: /app/models/eo_detector_fp16.engine
+      MANIFEST_PATH: /app/models/manifest.json
+      WORKER_PORT: ${WORKER_PORT}
+      ENGINE_WARMUP_SEC: "2.0"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/status"]
+      interval: 5s
+      timeout: 3s
+      retries: 2
+      start_period: 4s
+    networks:
+      - sensor_backplane
+
+  vision_api:
+    image: devops_challenge-vision_api:v1.4.2
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "vision_api/app.py"]
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      APP_PORT: ${APP_PORT}
+      WORKER_URL: "http://inference_worker:${WORKER_PORT}"
+      DB_HOST: "postgres"
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+    ports:
+      - "${APP_PORT}:8000"
+    depends_on:
+      inference_worker:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    networks:
+      - edge_dmz
+      - sensor_backplane
+
+networks:
+  edge_dmz:
+    driver: bridge
+  sensor_backplane:
+    driver: bridge
+    internal: true
